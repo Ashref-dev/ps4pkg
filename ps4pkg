@@ -15,7 +15,7 @@
 
 set -uo pipefail
 
-readonly PS4PKG_VERSION="1.1.0"
+readonly PS4PKG_VERSION="1.1.1"
 readonly HOME_DIR="${PS4PKG_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/ps4pkg}"
 readonly EXTRACTOR="$HOME_DIR/bin/pkg-extractor"
 
@@ -286,10 +286,19 @@ title_id_of() {
     | sed -n 's/.*-\(CUSA[0-9]*\)_.*/\1/p'
 }
 
+# A game, its update and its DLC share one title id, so the label has to be part
+# of the match or extracting an update would look like the game was already done.
+kind_suffix() {
+  case "$1" in
+    update) printf ' (Update)' ;;
+    dlc) printf ' (DLC)' ;;
+  esac
+}
+
 existing_folder_for() {
-  local dest="$1" id="$2"
+  local dest="$1" id="$2" kind="$3"
   [ -n "$id" ] || return 1
-  find "$dest" -maxdepth 1 -type d -name "*[[]${id}[]]*" 2>/dev/null | head -1
+  find "$dest" -maxdepth 1 -type d -name "*[[]${id}[]]$(kind_suffix "$kind")" 2>/dev/null | head -1
 }
 
 read_sfo() {
@@ -375,7 +384,7 @@ extract_one() {
 
   local early_id existing
   early_id="$(title_id_of "$pkg")"
-  existing="$(existing_folder_for "$dest" "$early_id")"
+  existing="$(existing_folder_for "$dest" "$early_id" "$kind")"
   if [ -n "$existing" ]; then
     printf '\n'
     bad "Already extracted, skipping to save you the wait:"
@@ -479,15 +488,13 @@ extract_one() {
   fi
 
   local title title_id folder final elapsed
-  title_id="$(basename "$game_dir")"
+  # The engine names an update folder CUSA12345-patch; the label already says so.
+  title_id="${early_id:-$(basename "$game_dir")}"
+  title_id="${title_id%-patch}"
   title="$(read_sfo "$game_dir/sce_sys/param.sfo" TITLE)"
   [ -n "$title" ] || title="$title_id"
 
-  folder="$(safe_name "$title") [$title_id]"
-  case "$kind" in
-    update) folder="$folder (Update)" ;;
-    dlc) folder="$folder (DLC)" ;;
-  esac
+  folder="$(safe_name "$title") [$title_id]$(kind_suffix "$kind")"
   final="$dest/$folder"
 
   if [ -e "$final" ]; then
