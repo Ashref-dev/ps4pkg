@@ -1,0 +1,8 @@
+# Build artifacts from the vendored Crypto++ sources
+vendor/cryptopp/*.o
+vendor/cryptopp/*.a
+vendor/cryptopp/*.so
+vendor/cryptopp/*.dylib
+vendor/cryptopp/cryptest*
+build/
+.DS_Store

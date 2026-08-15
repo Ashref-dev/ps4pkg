@@ -13,9 +13,13 @@
 
 set -uo pipefail
 
-readonly RAW_URL="https://raw.githubusercontent.com/Ashref-dev/ps4pkg/main/ps4pkg"
+# Installs the latest published release, falling back to the main branch if the
+# release download is unavailable.
+readonly RELEASE_TARBALL="https://github.com/Ashref-dev/ps4pkg/releases/latest/download/ps4pkg.tar.gz"
+readonly BRANCH_TARBALL="https://codeload.github.com/Ashref-dev/ps4pkg/tar.gz/refs/heads/main"
+readonly APP_DIR="${PS4PKG_APP_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ps4pkg/app}"
 readonly BIN_DIR="${PS4PKG_BIN_DIR:-$HOME/.local/bin}"
-readonly TARGET="$BIN_DIR/ps4pkg"
+readonly LINK="$BIN_DIR/ps4pkg"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   ON=$'\033[38;5;214m'; DIM=$'\033[38;5;244m'; BAD=$'\033[38;5;203m'
@@ -40,9 +44,8 @@ if ! xcode-select -p >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! command -v brew >/dev/null 2>&1; then
-  fail "Homebrew is required. Install it from https://brew.sh then run this again."
-fi
+command -v brew >/dev/null 2>&1 \
+  || fail "Homebrew is required. Install it from https://brew.sh then run this again."
 
 need=()
 command -v cmake >/dev/null 2>&1 || need+=("cmake")
@@ -53,15 +56,30 @@ if [ "${#need[@]}" -gt 0 ]; then
 fi
 good "Requirements ready"
 
-step "Downloading ps4pkg"
-mkdir -p "$BIN_DIR" || fail "Cannot create $BIN_DIR"
-if [ -f "./ps4pkg" ] && [ -z "${PS4PKG_FORCE_DOWNLOAD:-}" ]; then
-  cp "./ps4pkg" "$TARGET" || fail "Could not copy ps4pkg"
+if [ -f "./ps4pkg" ] && [ -d "./vendor" ]; then
+  APP_SRC="$(pwd)"
+  good "Using the copy in $APP_SRC"
 else
-  curl -fsSL "$RAW_URL" -o "$TARGET" || fail "Download failed"
+  step "Downloading ps4pkg"
+  tmp="$(mktemp -d)" || fail "Cannot create a temporary folder"
+  trap 'rm -rf "$tmp"' EXIT
+  if ! curl -fsSL "$RELEASE_TARBALL" | tar xz -C "$tmp" 2>/dev/null; then
+    curl -fsSL "$BRANCH_TARBALL" | tar xz -C "$tmp" || fail "Download failed"
+  fi
+  extracted="$(find "$tmp" -maxdepth 1 -type d \( -name 'ps4pkg-*' -o -name 'ps4pkg' \) | head -1)"
+  [ -z "$extracted" ] && [ -f "$tmp/ps4pkg" ] && extracted="$tmp"
+  [ -n "$extracted" ] || fail "Download looked wrong - no ps4pkg folder inside"
+  rm -rf "$APP_DIR"
+  mkdir -p "$(dirname "$APP_DIR")" || fail "Cannot create $(dirname "$APP_DIR")"
+  mv "$extracted" "$APP_DIR" || fail "Could not install into $APP_DIR"
+  APP_SRC="$APP_DIR"
+  good "Installed to $APP_DIR"
 fi
-chmod +x "$TARGET"
-good "Installed to $TARGET"
+
+chmod +x "$APP_SRC/ps4pkg"
+mkdir -p "$BIN_DIR" || fail "Cannot create $BIN_DIR"
+ln -sf "$APP_SRC/ps4pkg" "$LINK"
+good "Command available as $LINK"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
@@ -75,9 +93,9 @@ case ":$PATH:" in
 esac
 
 printf '\n'
-step "Building the extraction engine (about a minute)"
+step "Building the extraction engine (about half a minute)"
 printf '\n'
-"$TARGET" install || fail "Engine build failed. Run 'ps4pkg doctor' to see what is missing."
+"$LINK" install || fail "Engine build failed. Run 'ps4pkg doctor' to see what is missing."
 
 printf '  %sAll set. Open a new terminal, then:%s\n\n' "$DIM" "$R"
 printf '    ps4pkg extract "YourGame.pkg"\n\n'

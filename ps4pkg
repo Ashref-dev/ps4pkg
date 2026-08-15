@@ -15,14 +15,23 @@
 
 set -uo pipefail
 
-readonly PS4PKG_VERSION="1.0.0"
+readonly PS4PKG_VERSION="1.1.0"
 readonly HOME_DIR="${PS4PKG_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/ps4pkg}"
-readonly SRC_DIR="$HOME_DIR/src"
 readonly EXTRACTOR="$HOME_DIR/bin/pkg-extractor"
-readonly REPO_URL="https://github.com/AzaharPlus/shadPS4Plus.git"
-readonly REPO_BRANCH="ShadPs4Plus"
-# Pinned so an upstream change can never silently break or alter what gets built.
-readonly REPO_COMMIT="9d2e76127ce32d13192f9a6ab84a96404677394a"
+
+# The extractor sources ship inside this repository, so a build never depends on
+# another project remaining online.
+self_dir() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -L "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ $src != /* ]] && src="$dir/$src"
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+VENDOR_DIR="$(self_dir)/vendor"
+readonly VENDOR_DIR
 
 # ---------------------------------------------------------------- appearance
 
@@ -186,31 +195,9 @@ spin_run() {
   return 0
 }
 
-apply_macos_patch() {
-  local f="$SRC_DIR/src/common/io_file.cpp"
-  grep -q '__APPLE__' "$f" && return 0
-  grep -q 'fseeko64(file, offset' "$f" || return 0
-  # macOS has no fseeko64; its fseeko is already 64-bit. Upstream targets
-  # Linux/Windows only, so without this substitution the build cannot compile.
-  /usr/bin/sed -i '' \
-    's|    const auto seek_result = fseeko64(file, offset, ToSeekOrigin(origin)) == 0;|#ifdef __APPLE__\n    const auto seek_result = fseeko(file, offset, ToSeekOrigin(origin)) == 0;\n#else\n    const auto seek_result = fseeko64(file, offset, ToSeekOrigin(origin)) == 0;\n#endif|' \
-    "$f"
-}
-
-do_clone() {
-  if [ ! -d "$SRC_DIR/.git" ]; then
-    mkdir -p "$(dirname "$SRC_DIR")"
-    git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" "$SRC_DIR" || return 1
-  fi
-  git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null | grep -q "^$REPO_COMMIT" && return 0
-  git -C "$SRC_DIR" fetch --depth 1 origin "$REPO_COMMIT" || return 1
-  git -C "$SRC_DIR" checkout --detach FETCH_HEAD || return 1
-}
-
 do_cryptopp() {
-  [ -f "$SRC_DIR/externals/cryptopp/libcryptopp.a" ] && return 0
-  git -C "$SRC_DIR" submodule update --init --depth 1 externals/cryptopp || return 1
-  (cd "$SRC_DIR/externals/cryptopp" && make -j"$(sysctl -n hw.ncpu)" static)
+  [ -f "$VENDOR_DIR/cryptopp/libcryptopp.a" ] && return 0
+  (cd "$VENDOR_DIR/cryptopp" && make -j"$(sysctl -n hw.ncpu)" static)
 }
 
 zlib_prefix() {
@@ -222,14 +209,11 @@ zlib_prefix() {
 }
 
 do_build() {
-  local build="$SRC_DIR/extractor/build-macos" zlib
-  apply_macos_patch || return 1
+  local build="$HOME_DIR/build" zlib
   rm -rf "$build"
-  mkdir -p "$build/cryptopp/cryptopp" "$HOME_DIR/bin"
-  cp "$SRC_DIR/externals/cryptopp/libcryptopp.a" "$build/cryptopp/cryptopp/" || return 1
+  mkdir -p "$build" "$HOME_DIR/bin"
   zlib="$(zlib_prefix)" || return 1
-  cmake -S "$SRC_DIR/extractor" -B "$build" \
-    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release \
+  cmake -S "$VENDOR_DIR" -B "$build" -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_POLICY_DEFAULT_CMP0074=NEW \
     -DCMAKE_PREFIX_PATH="$zlib" -DZLIB_ROOT="$zlib" || return 1
   cmake --build "$build" || return 1
@@ -242,8 +226,10 @@ cmd_install() {
   say "  Setting up the extraction engine. This happens once."
   printf '\n'
 
+  [ -d "$VENDOR_DIR/shadps4" ] && [ -d "$VENDOR_DIR/cryptopp" ] \
+    || die "the bundled sources are missing from $VENDOR_DIR - re-download ps4pkg"
+
   local missing=()
-  command -v git >/dev/null || missing+=("git")
   command -v cmake >/dev/null || missing+=("cmake")
   command -v make >/dev/null || missing+=("make")
   if [ "${#missing[@]}" -gt 0 ]; then
@@ -261,7 +247,6 @@ cmd_install() {
     exit 1
   fi
 
-  spin_run "Fetching ShadPs4Plus source" do_clone || exit 1
   spin_run "Building crypto library" do_cryptopp || exit 1
   spin_run "Compiling extractor for macOS" do_build || exit 1
 
@@ -588,7 +573,7 @@ cmd_check() {
 cmd_doctor() {
   banner
   local t
-  for t in git cmake make python3; do
+  for t in cmake make python3; do
     if command -v "$t" >/dev/null; then ok "$t"; else bad "$t is missing"; fi
   done
   if [ -x "$EXTRACTOR" ]; then ok "extraction engine built"; else bad "engine not built - run: ps4pkg install"; fi

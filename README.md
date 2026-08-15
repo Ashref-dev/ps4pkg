@@ -47,11 +47,15 @@ curl -fsSL https://raw.githubusercontent.com/Ashref-dev/ps4pkg/main/install.sh |
 ```
 
 That installs what's needed, downloads `ps4pkg`, and builds the extraction engine
-(about a minute, once). Then open a new terminal window and you're ready.
+(about half a minute, once). Then open a new terminal window and you're ready.
 
 **Requirements:** macOS (Apple Silicon or Intel), [Homebrew](https://brew.sh), and
 Apple's command line tools. The installer checks for all three and tells you exactly
 what to do if something's missing.
+
+**Everything is in this repository.** The extraction engine's source is bundled in
+[`vendor/`](vendor), so installing does not depend on any other project staying online.
+Nothing is fetched from third-party repositories at install time.
 
 ---
 
@@ -162,13 +166,16 @@ The actual extraction is done by `pkg_extractor` from
 code that used to live inside shadPS4 itself, which makes it the most faithful choice
 available.
 
-That project publishes Windows and Linux builds only. `ps4pkg` clones it, applies a
-small macOS compatibility fix (macOS has no `fseeko64`; its `fseeko` is already
-64-bit), builds it against Homebrew's zlib, and wraps it in an interface designed for
-humans: live progress, real game names read from `param.sfo`, safe interrupts, and
-sensible refusal to destroy anything.
+That project publishes Windows and Linux builds only. `ps4pkg` bundles the sources it
+needs in [`vendor/`](vendor), applies a small macOS compatibility fix (macOS has no
+`fseeko64`; its `fseeko` is already 64-bit), builds them against Homebrew's zlib, and
+wraps the result in an interface designed for humans: live progress, real game names
+read from `param.sfo`, safe interrupts, and sensible refusal to destroy anything.
 
-Nothing from that project is redistributed here. It's fetched and built on your machine.
+The bundled code is redistributed under its original licenses, with its origin,
+exact commit, and the one modification documented in
+[`vendor/NOTICE.md`](vendor/NOTICE.md). Only the files required to build the extractor
+are included — not the rest of the emulator.
 
 ---
 
