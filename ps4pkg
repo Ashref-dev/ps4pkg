@@ -15,7 +15,7 @@
 
 set -uo pipefail
 
-readonly PS4PKG_VERSION="1.1.1"
+readonly PS4PKG_VERSION="1.1.2"
 readonly HOME_DIR="${PS4PKG_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/ps4pkg}"
 readonly EXTRACTOR="$HOME_DIR/bin/pkg-extractor"
 
@@ -217,7 +217,11 @@ do_build() {
     -DCMAKE_POLICY_DEFAULT_CMP0074=NEW \
     -DCMAKE_PREFIX_PATH="$zlib" -DZLIB_ROOT="$zlib" || return 1
   cmake --build "$build" || return 1
-  cp "$build/pkg_extractor" "$EXTRACTOR"
+  cp "$build/pkg_extractor" "$EXTRACTOR" || return 1
+  # The extractor links Crypto++ statically, so the object files and archive are
+  # dead weight afterwards - about 90 MB of it.
+  rm -rf "$build"
+  rm -f "$VENDOR_DIR"/cryptopp/*.o "$VENDOR_DIR/cryptopp/libcryptopp.a"
 }
 
 cmd_install() {
