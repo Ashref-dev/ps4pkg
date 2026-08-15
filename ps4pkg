@@ -21,6 +21,8 @@ readonly SRC_DIR="$HOME_DIR/src"
 readonly EXTRACTOR="$HOME_DIR/bin/pkg-extractor"
 readonly REPO_URL="https://github.com/AzaharPlus/shadPS4Plus.git"
 readonly REPO_BRANCH="ShadPs4Plus"
+# Pinned so an upstream change can never silently break or alter what gets built.
+readonly REPO_COMMIT="9d2e76127ce32d13192f9a6ab84a96404677394a"
 
 # ---------------------------------------------------------------- appearance
 
@@ -196,13 +198,13 @@ apply_macos_patch() {
 }
 
 do_clone() {
-  if [ -d "$SRC_DIR/.git" ]; then
-    git -C "$SRC_DIR" fetch --depth 1 origin "$REPO_BRANCH" \
-      && git -C "$SRC_DIR" reset --hard "origin/$REPO_BRANCH"
-  else
+  if [ ! -d "$SRC_DIR/.git" ]; then
     mkdir -p "$(dirname "$SRC_DIR")"
-    git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" "$SRC_DIR"
+    git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" "$SRC_DIR" || return 1
   fi
+  git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null | grep -q "^$REPO_COMMIT" && return 0
+  git -C "$SRC_DIR" fetch --depth 1 origin "$REPO_COMMIT" || return 1
+  git -C "$SRC_DIR" checkout --detach FETCH_HEAD || return 1
 }
 
 do_cryptopp() {
