@@ -1,0 +1,656 @@
+#!/usr/bin/env bash
+#
+# ps4pkg - extract PS4 .pkg files into folders shadPS4 can play, on macOS.
+#
+# Copyright (C) 2026 Achraf Ben Abdallah <https://github.com/Ashref-dev>
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 2 of the License, or (at your option) any later
+# version. See the LICENSE file for the full text.
+#
+# Extraction is performed by pkg_extractor from AzaharPlus/shadPS4Plus (GPL-2.0),
+# which is the PKG handling code that used to live inside shadPS4 itself.
+# ps4pkg downloads and builds that tool locally; it does not redistribute it.
+
+set -uo pipefail
+
+readonly PS4PKG_VERSION="1.0.0"
+readonly HOME_DIR="${PS4PKG_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/ps4pkg}"
+readonly SRC_DIR="$HOME_DIR/src"
+readonly EXTRACTOR="$HOME_DIR/bin/pkg-extractor"
+readonly REPO_URL="https://github.com/AzaharPlus/shadPS4Plus.git"
+readonly REPO_BRANCH="ShadPs4Plus"
+
+# ---------------------------------------------------------------- appearance
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
+  readonly C_ON=$'\033[38;5;214m'
+  readonly C_OFF=$'\033[38;5;238m'
+  readonly C_TEXT=$'\033[38;5;253m'
+  readonly C_DIM=$'\033[38;5;244m'
+  readonly C_OK=$'\033[38;5;114m'
+  readonly C_BAD=$'\033[38;5;203m'
+  readonly C_R=$'\033[0m'
+  readonly TTY=1
+else
+  readonly C_ON="" C_OFF="" C_TEXT="" C_DIM="" C_OK="" C_BAD="" C_R=""
+  readonly TTY=0
+fi
+
+readonly DOT_ON="●"
+readonly DOT_OFF="·"
+readonly CELL_FULL="⣿"
+readonly CELL_EMPTY="⣀"
+readonly SPIN_FRAMES=(⣾ ⣽ ⣻ ⢿ ⡿ ⣟ ⣯ ⣷)
+
+# 5x7 dot matrix glyphs, one row per line, 1 = lit.
+glyph_rows() {
+  case "$1" in
+    P) printf '%s\n' 11110 10001 10001 11110 10000 10000 10000 ;;
+    S) printf '%s\n' 01111 10000 10000 01110 00001 00001 11110 ;;
+    4) printf '%s\n' 00010 00110 01010 10010 11111 00010 00010 ;;
+    K) printf '%s\n' 10001 10010 10100 11000 10100 10010 10001 ;;
+    G) printf '%s\n' 01110 10001 10000 10111 10001 10001 01111 ;;
+    *) printf '%s\n' 00000 00000 00000 00000 00000 00000 00000 ;;
+  esac
+}
+
+banner() {
+  local word="PS4PKG" row i ch bits out
+  printf '\n'
+  for row in 0 1 2 3 4 5 6; do
+    out="  "
+    for ((i = 0; i < ${#word}; i++)); do
+      ch="${word:i:1}"
+      bits="$(glyph_rows "$ch" | sed -n "$((row + 1))p")"
+      for ((c = 0; c < 5; c++)); do
+        if [ "${bits:c:1}" = "1" ]; then
+          out+="${C_ON}${DOT_ON}${C_R} "
+        else
+          out+="${C_OFF}${DOT_OFF}${C_R} "
+        fi
+      done
+      out+="  "
+    done
+    printf '%s\n' "$out"
+  done
+  printf '  %sPS4 packages into shadPS4 games  ·  v%s%s\n\n' "$C_DIM" "$PS4PKG_VERSION" "$C_R"
+}
+
+say() { printf '%s%s%s\n' "$C_TEXT" "$*" "$C_R"; }
+dim() { printf '%s%s%s\n' "$C_DIM" "$*" "$C_R"; }
+ok() { printf '  %s%s%s %s\n' "$C_OK" "$DOT_ON" "$C_R" "$*"; }
+bad() { printf '  %s%s%s %s\n' "$C_BAD" "$DOT_ON" "$C_R" "$*" >&2; }
+step() { printf '  %s%s%s %s\n' "$C_ON" "$DOT_ON" "$C_R" "$*"; }
+
+field() { printf '  %s%-9s%s %s\n' "$C_DIM" "$1" "$C_R" "$2"; }
+
+die() {
+  printf '\n  %s%s ps4pkg:%s %s\n\n' "$C_BAD" "$DOT_ON" "$C_R" "$*" >&2
+  exit 1
+}
+
+hide_cursor() { [ "$TTY" -eq 1 ] && printf '\033[?25l'; }
+show_cursor() { [ "$TTY" -eq 1 ] && printf '\033[?25h'; }
+
+matrix_bar() {
+  local pct="$1" width="${2:-24}" filled i out=""
+  [ "$pct" -lt 0 ] && pct=0
+  [ "$pct" -gt 100 ] && pct=100
+  filled=$((pct * width / 100))
+  out="$C_ON"
+  for ((i = 0; i < width; i++)); do
+    [ "$i" -eq "$filled" ] && out+="$C_OFF"
+    if [ "$i" -lt "$filled" ]; then out+="$CELL_FULL"; else out+="$CELL_EMPTY"; fi
+  done
+  printf '%s%s' "$out" "$C_R"
+}
+
+human_size() {
+  awk -v b="$1" 'BEGIN{
+    split("B KB MB GB TB", u, " "); i = 1
+    while (b >= 1024 && i < 5) { b /= 1024; i++ }
+    printf (i <= 2 ? "%.0f %s" : "%.2f %s"), b, u[i]
+  }'
+}
+
+human_time() {
+  local s="$1"
+  if [ "$s" -ge 3600 ]; then
+    printf '%dh %02dm' "$((s / 3600))" "$(((s % 3600) / 60))"
+  else
+    printf '%dm %02ds' "$((s / 60))" "$((s % 60))"
+  fi
+}
+
+# ------------------------------------------------------------------ platform
+
+require_macos() {
+  [ "$(uname -s)" = "Darwin" ] || die "ps4pkg targets macOS. For other systems use the official ShadPs4Plus builds."
+}
+
+extractor_bin() {
+  [ -x "$EXTRACTOR" ] || die "extractor not built yet. Run: ps4pkg install"
+  printf '%s' "$EXTRACTOR"
+}
+
+require_pkg() {
+  [ -e "$1" ] || die "no such file: $1"
+  [ -f "$1" ] || die "not a file: $1"
+  [ -r "$1" ] || die "cannot read (check permissions): $1"
+  case "$1" in
+    *.pkg | *.PKG) ;;
+    *) die "not a .pkg file: $1" ;;
+  esac
+}
+
+free_bytes() {
+  df -k "$1" 2>/dev/null | awk 'NR==2 {print $4 * 1024}'
+}
+
+# ------------------------------------------------------------------- install
+
+spin_run() {
+  local label="$1"
+  shift
+  local log frame=0 pid rc
+  log="$(mktemp -t ps4pkg-build)"
+  ("$@") >"$log" 2>&1 &
+  pid=$!
+  if [ "$TTY" -eq 1 ]; then
+    hide_cursor
+    while kill -0 "$pid" 2>/dev/null; do
+      printf '\r  %s%s%s %s   ' "$C_ON" "${SPIN_FRAMES[frame % 8]}" "$C_R" "$label"
+      frame=$((frame + 1))
+      sleep 0.12
+    done
+    show_cursor
+  else
+    printf '  %s\n' "$label"
+  fi
+  wait "$pid"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ "$TTY" -eq 1 ] && printf '\r%*s\r' 70 ''
+    bad "$label - failed"
+    dim "$(tail -15 "$log" | sed 's/^/      /')"
+    rm -f "$log"
+    return 1
+  fi
+  [ "$TTY" -eq 1 ] && printf '\r%*s\r' 70 ''
+  ok "$label"
+  rm -f "$log"
+  return 0
+}
+
+apply_macos_patch() {
+  local f="$SRC_DIR/src/common/io_file.cpp"
+  grep -q '__APPLE__' "$f" && return 0
+  grep -q 'fseeko64(file, offset' "$f" || return 0
+  # macOS has no fseeko64; its fseeko is already 64-bit. Upstream targets
+  # Linux/Windows only, so without this substitution the build cannot compile.
+  /usr/bin/sed -i '' \
+    's|    const auto seek_result = fseeko64(file, offset, ToSeekOrigin(origin)) == 0;|#ifdef __APPLE__\n    const auto seek_result = fseeko(file, offset, ToSeekOrigin(origin)) == 0;\n#else\n    const auto seek_result = fseeko64(file, offset, ToSeekOrigin(origin)) == 0;\n#endif|' \
+    "$f"
+}
+
+do_clone() {
+  if [ -d "$SRC_DIR/.git" ]; then
+    git -C "$SRC_DIR" fetch --depth 1 origin "$REPO_BRANCH" \
+      && git -C "$SRC_DIR" reset --hard "origin/$REPO_BRANCH"
+  else
+    mkdir -p "$(dirname "$SRC_DIR")"
+    git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" "$SRC_DIR"
+  fi
+}
+
+do_cryptopp() {
+  [ -f "$SRC_DIR/externals/cryptopp/libcryptopp.a" ] && return 0
+  git -C "$SRC_DIR" submodule update --init --depth 1 externals/cryptopp || return 1
+  (cd "$SRC_DIR/externals/cryptopp" && make -j"$(sysctl -n hw.ncpu)" static)
+}
+
+zlib_prefix() {
+  local p
+  for p in "$(brew --prefix zlib 2>/dev/null)" /opt/homebrew/opt/zlib /usr/local/opt/zlib; do
+    [ -n "$p" ] && [ -f "$p/lib/libz.dylib" ] && printf '%s' "$p" && return 0
+  done
+  return 1
+}
+
+do_build() {
+  local build="$SRC_DIR/extractor/build-macos" zlib
+  apply_macos_patch || return 1
+  rm -rf "$build"
+  mkdir -p "$build/cryptopp/cryptopp" "$HOME_DIR/bin"
+  cp "$SRC_DIR/externals/cryptopp/libcryptopp.a" "$build/cryptopp/cryptopp/" || return 1
+  zlib="$(zlib_prefix)" || return 1
+  cmake -S "$SRC_DIR/extractor" -B "$build" \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POLICY_DEFAULT_CMP0074=NEW \
+    -DCMAKE_PREFIX_PATH="$zlib" -DZLIB_ROOT="$zlib" || return 1
+  cmake --build "$build" || return 1
+  cp "$build/pkg_extractor" "$EXTRACTOR"
+}
+
+cmd_install() {
+  require_macos
+  banner
+  say "  Setting up the extraction engine. This happens once."
+  printf '\n'
+
+  local missing=()
+  command -v git >/dev/null || missing+=("git")
+  command -v cmake >/dev/null || missing+=("cmake")
+  command -v make >/dev/null || missing+=("make")
+  if [ "${#missing[@]}" -gt 0 ]; then
+    bad "Missing: ${missing[*]}"
+    dim "      Install them with:  brew install ${missing[*]}"
+    dim "      (If you have no brew: https://brew.sh)"
+    exit 1
+  fi
+
+  if ! pkg-config --atleast-version=1.3 zlib 2>/dev/null \
+    && [ ! -f /opt/homebrew/opt/zlib/lib/libz.dylib ] \
+    && [ ! -f /usr/local/opt/zlib/lib/libz.dylib ]; then
+    bad "zlib 1.3 or newer is required (macOS ships an older one)"
+    dim "      Install it with:  brew install zlib"
+    exit 1
+  fi
+
+  spin_run "Fetching ShadPs4Plus source" do_clone || exit 1
+  spin_run "Building crypto library" do_cryptopp || exit 1
+  spin_run "Compiling extractor for macOS" do_build || exit 1
+
+  printf '\n'
+  ok "Engine ready"
+  field "Location" "$EXTRACTOR"
+  printf '\n'
+  say "  Try it:   ps4pkg extract \"YourGame.pkg\""
+  printf '\n'
+}
+
+# --------------------------------------------------------------------- probe
+
+pkg_kind() {
+  local out rc
+  out="$("$(extractor_bin)" "$1" --check-type 2>&1)"
+  rc=$?
+  case "$rc" in
+    101) printf 'game' ;;
+    102) printf 'update' ;;
+    103) printf 'dlc' ;;
+    *)
+      case "$out" in
+        *"doesn't appear to be a valid PKG"*) printf 'invalid' ;;
+        *"Cannot open"*) printf 'unreadable' ;;
+        *) printf 'unknown' ;;
+      esac
+      ;;
+  esac
+}
+
+# The PKG header carries its content id at offset 0x40, e.g.
+# EP1063-CUSA13198_00-USOTSUKIHIME0001, so the title id is known before
+# spending minutes on a full extraction.
+title_id_of() {
+  dd if="$1" bs=1 skip=64 count=36 2>/dev/null | tr -d '\0' \
+    | sed -n 's/.*-\(CUSA[0-9]*\)_.*/\1/p'
+}
+
+existing_folder_for() {
+  local dest="$1" id="$2"
+  [ -n "$id" ] || return 1
+  find "$dest" -maxdepth 1 -type d -name "*[[]${id}[]]*" 2>/dev/null | head -1
+}
+
+read_sfo() {
+  command -v python3 >/dev/null || return 1
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
+import struct, sys
+path, want = sys.argv[1], sys.argv[2]
+try:
+    with open(path, 'rb') as fh:
+        blob = fh.read()
+    if blob[:4] != b'\x00PSF':
+        sys.exit(1)
+    key_off, data_off, count = struct.unpack_from('<III', blob, 8)
+    for i in range(count):
+        ko, fmt, length, _max, do = struct.unpack_from('<HHIII', blob, 20 + i * 16)
+        key = blob[key_off + ko:blob.index(b'\0', key_off + ko)].decode('utf-8', 'replace')
+        if key != want:
+            continue
+        raw = blob[data_off + do:data_off + do + length]
+        print(struct.unpack('<I', raw[:4])[0] if fmt == 0x0404
+              else raw.rstrip(b'\0').decode('utf-8', 'replace'))
+        break
+except Exception:
+    sys.exit(1)
+PY
+}
+
+safe_name() {
+  printf '%s' "$1" | tr '/:\\' '---' | tr -s ' ' | sed 's/^ *//; s/ *$//; s/\.*$//'
+}
+
+# ------------------------------------------------------------------- extract
+
+EX_STAGING=""
+EX_CHILD=""
+
+cleanup_run() {
+  show_cursor
+  printf '\n'
+  dim "  Stopping..."
+  # The engine must be fully dead before cleanup, otherwise it keeps writing
+  # into the folder being deleted and leaves debris behind.
+  if [ -n "$EX_CHILD" ]; then
+    kill "$EX_CHILD" 2>/dev/null
+    local waited=0
+    while kill -0 "$EX_CHILD" 2>/dev/null && [ "$waited" -lt 50 ]; do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    kill -9 "$EX_CHILD" 2>/dev/null
+    wait "$EX_CHILD" 2>/dev/null
+  fi
+  if [ -n "$EX_STAGING" ] && [ -d "$EX_STAGING" ]; then
+    dim "  Removing the incomplete folder so nothing broken is left behind."
+    rm -rf "$EX_STAGING"
+  fi
+  dim "  Your .pkg file was not touched."
+  printf '\n'
+  exit 130
+}
+
+extract_one() {
+  local pkg="$1" dest="${2:-}"
+  require_pkg "$pkg"
+  [ -n "$dest" ] || dest="$(cd "$(dirname "$pkg")" && pwd)"
+  [ -d "$dest" ] || die "destination folder does not exist: $dest"
+  [ -w "$dest" ] || die "destination folder is not writable: $dest"
+
+  local tool size kind free
+  tool="$(extractor_bin)" || exit 1
+  size="$(stat -f %z "$pkg")"
+  kind="$(pkg_kind "$pkg")"
+
+  case "$kind" in
+    invalid) die "this is not a readable PS4 package: $(basename "$pkg")" ;;
+    unreadable) die "the package could not be opened; it may be incomplete or corrupted" ;;
+  esac
+
+  free="$(free_bytes "$dest")"
+  if [ -n "$free" ] && [ "$free" -lt "$size" ]; then
+    die "not enough free space: needs about $(human_size "$size"), only $(human_size "$free") available"
+  fi
+
+  local early_id existing
+  early_id="$(title_id_of "$pkg")"
+  existing="$(existing_folder_for "$dest" "$early_id")"
+  if [ -n "$existing" ]; then
+    printf '\n'
+    bad "Already extracted, skipping to save you the wait:"
+    dim "      $existing"
+    dim "      Delete that folder first if you want to redo it."
+    printf '\n'
+    return 1
+  fi
+
+  printf '\n'
+  field "Package" "$(basename "$pkg")"
+  field "Size" "$(human_size "$size")"
+  field "Type" "$kind"
+  field "Into" "$dest"
+  printf '\n'
+
+  EX_STAGING="$(mktemp -d "$dest/.ps4pkg-working.XXXXXX")" || die "cannot write to $dest"
+  trap cleanup_run INT TERM
+
+  local log started frame=0 done_n=0 total_n=0 pct=0 written=0 last_du=0 eta_txt="--"
+  log="$(mktemp -t ps4pkg-run)"
+  started="$(date +%s)"
+
+  "$tool" "$pkg" "$EX_STAGING" >"$log" 2>&1 &
+  EX_CHILD=$!
+
+  hide_cursor
+  while kill -0 "$EX_CHILD" 2>/dev/null; do
+    local line now elapsed
+    line="$(tail -c 4096 "$log" 2>/dev/null | tr '\r' '\n' | grep 'Extracting file' | tail -1)"
+    if [ -n "$line" ]; then
+      done_n="$(printf '%s' "$line" | sed -n 's/.*file \([0-9]*\) of \([0-9]*\).*/\1/p')"
+      total_n="$(printf '%s' "$line" | sed -n 's/.*file \([0-9]*\) of \([0-9]*\).*/\2/p')"
+    fi
+    now="$(date +%s)"
+    elapsed=$((now - started))
+    if [ "$((now - last_du))" -ge 2 ]; then
+      written="$(du -sk "$EX_STAGING" 2>/dev/null | cut -f1)"
+      written=$((${written:-0} * 1024))
+      last_du="$now"
+    fi
+    if [ "${total_n:-0}" -gt 0 ] && [ "${done_n:-0}" -gt 0 ]; then
+      pct=$((done_n * 100 / total_n))
+      eta_txt="$(human_time $((elapsed * (total_n - done_n) / done_n)))"
+    fi
+
+    if [ "$TTY" -eq 1 ]; then
+      if [ "${total_n:-0}" -gt 0 ]; then
+        printf '\r  %s %s %s%3d%%%s  %s%s/%s files%s  %s%s%s  %sETA %s%s   ' \
+          "${SPIN_FRAMES[frame % 8]}" "$(matrix_bar "$pct" 20)" \
+          "$C_TEXT" "$pct" "$C_R" \
+          "$C_DIM" "$done_n" "$total_n" "$C_R" \
+          "$C_TEXT" "$(human_size "$written")" "$C_R" \
+          "$C_DIM" "$eta_txt" "$C_R"
+      else
+        printf '\r  %s%s%s Reading package  %s%s elapsed%s   ' \
+          "$C_ON" "${SPIN_FRAMES[frame % 8]}" "$C_R" "$C_DIM" "$(human_time "$elapsed")" "$C_R"
+      fi
+    fi
+    frame=$((frame + 1))
+    sleep 0.12
+  done
+  local rc=0
+  wait "$EX_CHILD" || rc=$?
+  EX_CHILD=""
+
+  # The polling loop can miss the final progress lines, so re-read the log once
+  # the engine has exited to get the true finished count.
+  local final_line
+  final_line="$(tail -c 4096 "$log" 2>/dev/null | tr '\r' '\n' | grep 'Extracting file' | tail -1)"
+  if [ -n "$final_line" ]; then
+    done_n="$(printf '%s' "$final_line" | sed -n 's/.*file \([0-9]*\) of \([0-9]*\).*/\1/p')"
+    total_n="$(printf '%s' "$final_line" | sed -n 's/.*file \([0-9]*\) of \([0-9]*\).*/\2/p')"
+  fi
+  show_cursor
+  [ "$TTY" -eq 1 ] && printf '\r%*s\r' 90 ''
+  trap - INT TERM
+
+  # A partial extraction must never be presented as a finished game, so the
+  # engine has to exit cleanly, report no error, and reach its own end marker.
+  local why=""
+  [ "$rc" -ne 0 ] && why="the extractor stopped early (exit $rc)"
+  grep -qE 'Cannot extract|Cannot open|Could not read' "$log" \
+    && why="$(grep -m1 -E 'Cannot|Could not' "$log")"
+  grep -q 'THE END' "$log" || why="${why:-the extractor did not finish}"
+  if [ "${total_n:-0}" -gt 0 ] && [ "${done_n:-0}" -lt "${total_n:-0}" ]; then
+    why="${why:-only $done_n of $total_n files were written}"
+  fi
+
+  local game_dir
+  game_dir="$(find "$EX_STAGING" -maxdepth 2 -type d -name sce_sys -exec dirname {} \; 2>/dev/null | head -1)"
+  [ -n "$game_dir" ] || why="${why:-no game data was found inside the package}"
+
+  if [ -n "$why" ]; then
+    bad "Extraction failed: $why"
+    dim "      Nothing was added to $dest, so no broken game is left behind."
+    rm -rf "$EX_STAGING"
+    rm -f "$log"
+    EX_STAGING=""
+    return 1
+  fi
+
+  local title title_id folder final elapsed
+  title_id="$(basename "$game_dir")"
+  title="$(read_sfo "$game_dir/sce_sys/param.sfo" TITLE)"
+  [ -n "$title" ] || title="$title_id"
+
+  folder="$(safe_name "$title") [$title_id]"
+  case "$kind" in
+    update) folder="$folder (Update)" ;;
+    dlc) folder="$folder (DLC)" ;;
+  esac
+  final="$dest/$folder"
+
+  if [ -e "$final" ]; then
+    bad "A folder for this already exists, so nothing was overwritten:"
+    dim "      $final"
+    rm -rf "$EX_STAGING"
+    rm -f "$log"
+    EX_STAGING=""
+    return 1
+  fi
+
+  mv "$game_dir" "$final" || die "could not move the extracted game into place"
+  rm -rf "$EX_STAGING"
+  rm -f "$log"
+  EX_STAGING=""
+
+  elapsed=$(($(date +%s) - started))
+  printf '  %s %s%s%s\n\n' "$(matrix_bar 100 20)" "$C_OK" "complete" "$C_R"
+  field "Game" "$title"
+  field "Title ID" "$title_id"
+  field "Folder" "$final"
+  field "Took" "$(human_time "$elapsed")"
+  if [ -f "$final/eboot.bin" ]; then
+    printf '\n'
+    ok "Ready for shadPS4. Point its game folder at: $dest"
+  else
+    printf '\n'
+    dim "  No eboot.bin inside, so this is add-on content, not a bootable game."
+  fi
+  printf '\n'
+  return 0
+}
+
+cmd_batch() {
+  local dir="${1:-$PWD}"
+  [ -d "$dir" ] || die "no such folder: $dir"
+  dir="$(cd "$dir" && pwd)"
+
+  local pkgs=() pkg
+  while IFS= read -r pkg; do pkgs+=("$pkg"); done \
+    < <(find "$dir" -maxdepth 1 -type f -iname '*.pkg' | sort)
+  [ "${#pkgs[@]}" -gt 0 ] || die "no .pkg files found in: $dir"
+
+  banner
+  say "  Found ${#pkgs[@]} package(s) in $dir"
+
+  local done_n=0 fail_n=0 i=0
+  for pkg in "${pkgs[@]}"; do
+    i=$((i + 1))
+    printf '\n  %s── %d of %d ──────────────────────────────────────%s\n' \
+      "$C_OFF" "$i" "${#pkgs[@]}" "$C_R"
+    if extract_one "$pkg" "$dir"; then
+      done_n=$((done_n + 1))
+    else
+      fail_n=$((fail_n + 1))
+    fi
+  done
+
+  printf '\n'
+  ok "Finished: $done_n extracted, $fail_n skipped"
+  printf '\n'
+}
+
+cmd_check() {
+  local dir_or_file="${1:-$PWD}"
+  if [ -d "$dir_or_file" ]; then
+    local pkg found=0
+    printf '\n'
+    while IFS= read -r pkg; do
+      found=1
+      printf '  %s%-8s%s %s\n' "$C_ON" "$(pkg_kind "$pkg")" "$C_R" "$(basename "$pkg")"
+    done < <(find "$dir_or_file" -maxdepth 1 -type f -iname '*.pkg' | sort)
+    printf '\n'
+    [ "$found" -eq 1 ] || die "no .pkg files found in: $dir_or_file"
+  else
+    require_pkg "$dir_or_file"
+    printf '\n'
+    field "$(pkg_kind "$dir_or_file")" "$(basename "$dir_or_file")"
+    printf '\n'
+  fi
+}
+
+cmd_doctor() {
+  banner
+  local t
+  for t in git cmake make python3; do
+    if command -v "$t" >/dev/null; then ok "$t"; else bad "$t is missing"; fi
+  done
+  if [ -x "$EXTRACTOR" ]; then ok "extraction engine built"; else bad "engine not built - run: ps4pkg install"; fi
+  printf '\n'
+}
+
+cmd_help() {
+  banner
+  cat <<EOF
+${C_TEXT}  USAGE${C_R}
+
+    ps4pkg extract <game.pkg> [folder]   turn one package into a playable folder
+    ps4pkg batch [folder]                do every .pkg in a folder
+    ps4pkg check [file or folder]        game, update, or DLC?
+    ps4pkg install                       build the extraction engine (once)
+    ps4pkg doctor                        check that everything is in place
+    ps4pkg version
+
+${C_TEXT}  HOW IT BEHAVES${C_R}
+
+    Extracts next to the package, into a folder named after the game.
+    Never deletes, moves, or edits your .pkg files.
+    Never writes over an existing folder.
+    Ctrl-C removes the half-finished folder instead of leaving a broken game.
+
+${C_TEXT}  EXAMPLE${C_R}
+
+    ps4pkg extract "EP1063-CUSA13198_00-USOTSUKIHIME0001-A0100-V0100.pkg"
+      -> The Liar Princess and the Blind Prince [CUSA13198]/
+
+${C_DIM}  By Achraf Ben Abdallah · https://github.com/Ashref-dev/ps4pkg${C_R}
+EOF
+  printf '\n'
+}
+
+# ---------------------------------------------------------------------- main
+
+case "${1:-help}" in
+  extract)
+    require_macos
+    [ "$#" -ge 2 ] || die "which package? try: ps4pkg extract \"YourGame.pkg\""
+    extract_one "$2" "${3:-}"
+    ;;
+  batch)
+    require_macos
+    cmd_batch "${2:-$PWD}"
+    ;;
+  check)
+    require_macos
+    cmd_check "${2:-$PWD}"
+    ;;
+  install | update)
+    cmd_install
+    ;;
+  doctor)
+    cmd_doctor
+    ;;
+  version | --version | -v)
+    printf 'ps4pkg %s\n' "$PS4PKG_VERSION"
+    ;;
+  help | --help | -h)
+    cmd_help
+    ;;
+  *)
+    die "unknown command: $1 (try: ps4pkg help)"
+    ;;
+esac
